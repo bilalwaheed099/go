@@ -4,12 +4,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"servers/internal/auth"
 	"servers/internal/database"
 
 	"github.com/google/uuid"
@@ -21,6 +23,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
 }
 
 type Chirp struct {
@@ -29,6 +32,21 @@ type Chirp struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	UserID    uuid.UUID `json:"user_id"`
 	Body      string    `json:"body"`
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+type UserWithToken struct {
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -80,6 +98,7 @@ func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
 	db, _ := sql.Open("postgres", dbURL)
 	dbQueries := database.New(db)
 	mux := http.NewServeMux()
@@ -87,6 +106,7 @@ func main() {
 	apiCfg := apiConfig{
 		db:       dbQueries,
 		platform: platform,
+		secret:   secret,
 	}
 
 	mux.Handle("/app/", http.StripPrefix("/app", apiCfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
@@ -95,7 +115,106 @@ func main() {
 		w.WriteHeader(200)
 		w.Write([]byte("OK"))
 	})
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		type loginRequestParams struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
 
+		params := loginRequestParams{}
+		decoder := json.NewDecoder(r.Body)
+		decoder.Decode(&params)
+
+		// get the user from the email.. includes the password
+		user, err := apiCfg.db.GetUserFromEmail(r.Context(), params.Email)
+		if err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("Incorrect email or password"))
+			return
+		}
+
+		err = auth.CheckPasswordHash(user.HashedPassword, params.Password)
+		if err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("Incorrect email or password"))
+			return
+		}
+
+		refreshToken, _ := auth.MakeRefreshToken()
+
+		apiCfg.db.AddRefreshToken(r.Context(), database.AddRefreshTokenParams{refreshToken, user.ID, time.Now().Add(144 * time.Hour)})
+
+		// JWT token
+		tokenExpiry := 3600
+		token, _ := auth.MakeJWT(user.ID, apiCfg.secret, time.Duration(tokenExpiry*int(time.Second)))
+		userToReturn := UserWithToken{
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt,
+			UpdatedAt:    user.UpdatedAt,
+			Email:        user.Email,
+			Token:        token,
+			RefreshToken: refreshToken,
+		}
+
+		w.WriteHeader(200)
+		data, _ := json.Marshal(userToReturn)
+		w.Write(data)
+	})
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		// validing jwt
+		log.Printf("***: %v", r.Header.Get("Authorization"))
+		token, tokenErr := auth.GetBearerToken(r.Header)
+		if tokenErr != nil {
+			log.Printf("%v", tokenErr)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token"))
+			return
+		}
+		refreshToken, err := apiCfg.db.GetUserFromRefreshToken(r.Context(), token)
+		if err != nil {
+			log.Printf("fucking error: %v", err)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token - does not exist"))
+			return
+		}
+		if refreshToken.ExpiresAt.Before(time.Now()) {
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token - expired"))
+			return
+		}
+
+		if refreshToken.RevokedAt.Valid {
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token - revoked"))
+			return
+		}
+		accessToken, _ := auth.MakeJWT(refreshToken.UserID, apiCfg.secret, time.Duration(3600*time.Second))
+
+		type tokenResponse struct {
+			Token string `json:"token"`
+		}
+
+		w.WriteHeader(200)
+		resp := tokenResponse{
+			Token: accessToken,
+		}
+		data, _ := json.Marshal(resp)
+		w.Write(data)
+	})
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		// validing jwt
+		token, tokenErr := auth.GetBearerToken(r.Header)
+		if tokenErr != nil {
+			log.Printf("%v", tokenErr)
+			w.Write([]byte("invalid refresh token"))
+			return
+		}
+
+		// revoke token
+		apiCfg.db.RevokeToken(r.Context(), token)
+		w.WriteHeader(204)
+		w.Write([]byte("token revoked"))
+	})
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
@@ -138,8 +257,7 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Body   string    `json:"body"`
-			UserID uuid.UUID `json:"user_id"`
+			Body string `json:"body"`
 		}
 
 		type errorResp struct {
@@ -153,6 +271,24 @@ func main() {
 		decoder := json.NewDecoder(r.Body)
 		params := parameters{}
 		err := decoder.Decode(&params)
+
+		// validing jwt
+
+		token, tokenErr := auth.GetBearerToken(r.Header)
+		if tokenErr != nil {
+			log.Printf("%v", tokenErr)
+			w.Write([]byte("invalid token"))
+			return
+		}
+
+		userID, validationErr := auth.ValidateJWT(token, apiCfg.secret)
+		if validationErr != nil {
+			log.Printf("%v", validationErr)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token"))
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			w.WriteHeader(500)
@@ -176,7 +312,7 @@ func main() {
 			return
 		}
 
-		chirp, err := apiCfg.db.CreateChirp(r.Context(), database.CreateChirpParams{Body: params.Body, UserID: params.UserID})
+		chirp, err := apiCfg.db.CreateChirp(r.Context(), database.CreateChirpParams{Body: params.Body, UserID: userID})
 		chirpToReturn := Chirp{
 			ID:        chirp.ID,
 			CreatedAt: chirp.CreatedAt,
@@ -196,7 +332,8 @@ func main() {
 
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 
 		params := parameters{}
@@ -217,8 +354,14 @@ func main() {
 			return
 		}
 
+		hashedPassword, err := auth.HashPassword(params.Password)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong while hashing password"))
+		}
+
 		// creating the new user in DB
-		user, err := apiCfg.db.CreateUser(r.Context(), params.Email)
+		user, err := apiCfg.db.CreateUser(r.Context(), database.CreateUserParams{Email: params.Email, HashedPassword: hashedPassword})
 		if err != nil {
 			errorResponse := errorResp{
 				Error: fmt.Sprintf("Error in creating the user: %v", err),
@@ -227,13 +370,6 @@ func main() {
 			data, _ := json.Marshal(errorResponse)
 			w.Write(data)
 			return
-		}
-
-		type User struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
 		}
 
 		userToReturn := User{
@@ -258,5 +394,3 @@ func main() {
 		fmt.Println("Error starting server: ", serverErr)
 	}
 }
-
-// postgres connection string "postgres://postgres:bilal123@localhost:5432/chripy"
