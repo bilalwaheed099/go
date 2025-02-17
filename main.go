@@ -172,7 +172,6 @@ func main() {
 		}
 		refreshToken, err := apiCfg.db.GetUserFromRefreshToken(r.Context(), token)
 		if err != nil {
-			log.Printf("fucking error: %v", err)
 			w.WriteHeader(401)
 			w.Write([]byte("invalid token - does not exist"))
 			return
@@ -214,6 +213,75 @@ func main() {
 		apiCfg.db.RevokeToken(r.Context(), token)
 		w.WriteHeader(204)
 		w.Write([]byte("token revoked"))
+	})
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		token, tokenErr := auth.GetBearerToken(r.Header)
+		if tokenErr != nil {
+			log.Printf("%v", tokenErr)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token"))
+			return
+		}
+
+		userID, validationErr := auth.ValidateJWT(token, apiCfg.secret)
+		if validationErr != nil {
+			log.Printf("%v", validationErr)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token"))
+			return
+		}
+
+		params := parameters{}
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&params)
+
+		type errorResp struct {
+			Error string `json:"error"`
+		}
+
+		if err != nil {
+			errorResponse := errorResp{
+				Error: "Invalid params",
+			}
+			w.WriteHeader(400)
+			data, _ := json.Marshal(errorResponse)
+			w.Write(data)
+			return
+		}
+
+		hashedPassword, err := auth.HashPassword(params.Password)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte("Something went wrong while hashing password"))
+		}
+
+		// creating the new user in DB
+		user, err := apiCfg.db.UpdateUser(r.Context(), database.UpdateUserParams{Email: params.Email, HashedPassword: hashedPassword, ID: userID})
+		if err != nil {
+			errorResponse := errorResp{
+				Error: fmt.Sprintf("Error in updating the user: %v", err),
+			}
+			w.WriteHeader(500)
+			data, _ := json.Marshal(errorResponse)
+			w.Write(data)
+			return
+		}
+
+		userToReturn := User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		}
+
+		w.WriteHeader(200)
+		data, _ := json.Marshal(userToReturn)
+		w.Write(data)
 	})
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
@@ -328,6 +396,51 @@ func main() {
 
 		data, _ := json.Marshal(chirpToReturn)
 		w.Write(data)
+	})
+	mux.HandleFunc("DELETE /api/chirps/{ID}", func(w http.ResponseWriter, r *http.Request) {
+		// verifying the token
+		token, tokenErr := auth.GetBearerToken(r.Header)
+		if tokenErr != nil {
+			log.Printf("%v", tokenErr)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token"))
+			return
+		}
+
+		userID, validationErr := auth.ValidateJWT(token, apiCfg.secret)
+		if validationErr != nil {
+			log.Printf("%v", validationErr)
+			w.WriteHeader(401)
+			w.Write([]byte("invalid token"))
+			return
+		}
+
+		// fetching the chirp
+		chirpID := r.PathValue("ID")
+		UUID, _ := uuid.Parse(chirpID)
+		chirp, err := apiCfg.db.GetChirp(r.Context(), UUID)
+		if err != nil {
+			w.WriteHeader(404)
+			w.Write([]byte("Chirp not found"))
+			return
+		}
+
+		// check if the user is the owner of the token
+		if chirp.UserID != userID {
+			w.WriteHeader(403)
+			w.Write([]byte("Unauthorized"))
+			return
+		}
+
+		err = apiCfg.db.DeleteChirp(r.Context(), UUID)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte("Server Error - something went wrong"))
+			return
+		}
+
+		w.WriteHeader(204)
+		w.Write([]byte("chirp deleted successfully"))
 	})
 
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
