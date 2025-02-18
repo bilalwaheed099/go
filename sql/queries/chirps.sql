@@ -10,7 +10,8 @@ $2
 RETURNING *;
 
 -- name: GetChirps :many
-SELECT * FROM chirps ORDER BY created_at ASC;
+SELECT * FROM chirps 
+WHERE ($1 = CAST('00000000-0000-0000-0000-000000000000' as uuid) OR user_id = $1);
 
 -- name: GetChirp :one
 SELECT * FROM chirps WHERE id = $1;

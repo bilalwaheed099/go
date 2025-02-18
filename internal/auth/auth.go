@@ -86,6 +86,19 @@ func GetBearerToken(headers http.Header) (string, error) {
 	return tokenString, nil
 }
 
+func GetAPIKey(header http.Header) (string, error) {
+	completeAPIKeyString := header.Get("Authorization")
+	if len(completeAPIKeyString) == 0 {
+		return "", fmt.Errorf("missing api key")
+	}
+	APIString := strings.Split(completeAPIKeyString, " ")[1]
+	if len(APIString) == 0 {
+		return "", fmt.Errorf("invalid api key")
+	}
+	log.Printf("%v", APIString)
+	return APIString, nil
+}
+
 func MakeRefreshToken() (string, error) {
 	randomBytes := make([]byte, 32)
 	_, err := rand.Read(randomBytes)

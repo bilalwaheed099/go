@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	secret         string
+	polkaKey       string
 }
 
 type Chirp struct {
@@ -35,10 +37,11 @@ type Chirp struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID          uuid.UUID `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Email       string    `json:"email"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 type UserWithToken struct {
 	ID           uuid.UUID `json:"id"`
@@ -47,6 +50,7 @@ type UserWithToken struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -99,6 +103,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	secret := os.Getenv("SECRET")
+	polkaKey := os.Getenv("POLKA_KEY")
 	db, _ := sql.Open("postgres", dbURL)
 	dbQueries := database.New(db)
 	mux := http.NewServeMux()
@@ -107,6 +112,7 @@ func main() {
 		db:       dbQueries,
 		platform: platform,
 		secret:   secret,
+		polkaKey: polkaKey,
 	}
 
 	mux.Handle("/app/", http.StripPrefix("/app", apiCfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
@@ -154,6 +160,7 @@ func main() {
 			Email:        user.Email,
 			Token:        token,
 			RefreshToken: refreshToken,
+			IsChirpyRed:  user.IsChirpyRed,
 		}
 
 		w.WriteHeader(200)
@@ -286,7 +293,20 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
-		chirps, _ := apiCfg.db.GetChirps(r.Context())
+		authorIDFromQuery := r.URL.Query().Get("author_id")
+		sortParam := r.URL.Query().Get("sort")
+
+		var chirps []database.Chirp
+		if len(authorIDFromQuery) == 0 {
+			chirpsFromDB, err := apiCfg.db.GetChirps(r.Context(), uuid.Nil)
+			if err != nil {
+				log.Printf("%v", err)
+			}
+			chirps = chirpsFromDB
+		} else {
+			authorID, _ := uuid.Parse(authorIDFromQuery)
+			chirps, _ = apiCfg.db.GetChirps(r.Context(), authorID)
+		}
 		apiChirps := make([]Chirp, len(chirps))
 		for i, chirp := range chirps {
 			apiChirps[i] = Chirp{
@@ -296,6 +316,15 @@ func main() {
 				Body:      chirp.Body,
 				UserID:    chirp.UserID,
 			}
+		}
+
+		log.Printf("%v", chirps)
+		log.Printf("%v", apiChirps)
+
+		if sortParam == "desc" {
+			sort.Slice(apiChirps, func(i, j int) bool { return apiChirps[i].CreatedAt.After(apiChirps[j].CreatedAt) })
+		} else {
+			sort.Slice(apiChirps, func(i, j int) bool { return apiChirps[i].CreatedAt.Before(apiChirps[j].CreatedAt) })
 		}
 
 		w.WriteHeader(200)
@@ -441,6 +470,51 @@ func main() {
 
 		w.WriteHeader(204)
 		w.Write([]byte("chirp deleted successfully"))
+	})
+
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		type data struct {
+			UserID uuid.UUID `json:"user_id"`
+		}
+		type parameters struct {
+			Event string `json:"event"`
+			Data  data   `json:"data"`
+		}
+
+		apiKey, apiKeyError := auth.GetAPIKey(r.Header)
+		if apiKeyError != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("api key invalid"))
+			return
+		}
+
+		if apiKey != apiCfg.polkaKey {
+			w.WriteHeader(401)
+			w.Write([]byte("API key incorrect"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		decoder.Decode(&params)
+
+		if params.Event != "user.upgraded" {
+			w.WriteHeader(204)
+			w.Write([]byte("method invalid"))
+			return
+		}
+
+		_, err := apiCfg.db.UpgradeUser(r.Context(), params.Data.UserID)
+		if err != nil {
+			w.WriteHeader(404)
+			w.Write([]byte("user not found"))
+		}
+
+		toReturn := User{}
+		dataToReturn, _ := json.Marshal(toReturn)
+
+		w.WriteHeader(204)
+		w.Write(dataToReturn)
 	})
 
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
